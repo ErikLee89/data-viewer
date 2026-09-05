@@ -297,10 +297,11 @@ function renderSidebar() {
   box.innerHTML = names.map(n => {
     const c = DATA.cols[n];
     const on = selected.has(n);
+    const angle = isAngleCol(n);
     return `<label class="col-item">
       <input type="checkbox" ${on ? "checked" : ""} onchange="toggleCol('${esc(n)}', this.checked)">
-      <span class="name" title="${esc(n)}${c.desc ? " · " + esc(c.desc) : ""}" ondblclick="renameCol('${esc(n)}', this)">${esc(displayName(n))}</span>
-      ${c.unit ? `<span class="unit">${esc(c.unit)}</span>` : ""}
+      <span class="name" title="${esc(n)}${c.desc ? " · " + esc(c.desc) : ""}${angle ? " · 角度列已自动展开(消除0/360跳变)" : ""}" ondblclick="renameCol('${esc(n)}', this)">${esc(displayName(n))}</span>
+      ${angle ? `<span class="unit" style="color:#722ed1" title="角度列已自动展开：相邻差>180°时±360°修正，消除0/360假跳变">展开</span>` : (c.unit ? `<span class="unit">${esc(c.unit)}</span>` : "")}
       <span class="rename-btn" onclick="renameCol('${esc(n)}', this.parentElement.querySelector('.name'))">改名</span>
     </label>`;
   }).join("");
@@ -346,14 +347,55 @@ function resetZoom() {
 }
 
 // ---------- 主图（K线式缩放：底部滑块可拖动/边缘缩放，主图滚轮缩放） ----------
+// ---------- 角度列展开（unwrapping） ----------
+// 0°与360°在方向上相邻，直接画线会出现大幅假跳变；展开为连续序列消除跳变
+const ANGLE_PAT = /(AWA|TWA|TWD|WDIR|DIR|HEADING|HDG|COG|COURSE|BEARING|BEARING)/i;
+
+function isAngleCol(name) {
+  const c = DATA.cols[name];
+  if (!c) return false;
+  if (ANGLE_PAT.test(name)) return true;
+  const u = (c.unit || "").toLowerCase();
+  return u === "°" || u === "deg" || u === "degree" || u === "度";
+}
+
+// 展开算法：相邻差 >180° 时 ±360° 修正，返回新数组（缓存避免重复计算）
+function unwrapSeries(name) {
+  const c = DATA.cols[name];
+  if (!c) return null;
+  if (!c._unwrapped) {
+    const v = c.v;
+    const out = new Array(v.length);
+    let offset = 0;
+    let prev = null;
+    for (let i = 0; i < v.length; i++) {
+      const x = v[i];
+      if (x == null) { out[i] = null; continue; }
+      if (prev != null) {
+        const d = x + offset - prev;
+        if (d > 180) offset -= 360;
+        else if (d < -180) offset += 360;
+      }
+      out[i] = x + offset;
+      prev = out[i];
+    }
+    c._unwrapped = out;
+  }
+  return c._unwrapped;
+}
+
+// 归一化到 [0,360) 仅用于判断显示（不影响展开值）
+
 function renderChart() {
   if (!chart) chart = echarts.init(document.getElementById("chart"));
   const t = DATA.t;
   const series = [...selected].map((n, i) => {
     const c = DATA.cols[n];
+    const angle = isAngleCol(n);
+    const vals = angle ? unwrapSeries(n) : c.v;
     return {
-      name: displayName(n), type: "line", showSymbol: false,
-      data: c.v.map((v, j) => [t[j], v]),
+      name: displayName(n) + (angle ? " (展开)" : ""), type: "line", showSymbol: false,
+      data: vals.map((v, j) => [t[j], v]),
       lineStyle: { width: 1.4 }, itemStyle: { color: PALETTE[i % PALETTE.length] },
     };
   });
