@@ -122,6 +122,7 @@ let FILE_HASH = null;     // 当前文件 SHA-256
 let colNames = {};        // 列名重命名映射 {原始名: 显示名}
 let saveTimer = null;     // UI 状态防抖保存
 let logCursor = -1;       // 日志轮询游标
+const formatterCache = { _key: null, _order: [] };  // tooltip 排序缓存
 let logPolling = false;   // 防止轮询堆积
 let loadGen = 0;           // 加载代际（防止会话恢复与手动上传竞争）
 
@@ -435,7 +436,20 @@ function renderChart() {
     animation: false,
     tooltip: {
       trigger: "axis",
-      axisPointer: { type: "cross", label: { backgroundColor: "#1f2937" } },
+      // 性能：关词 tooltip 位置过渡动画（默认 0.4s，是跟随延迟的主因）
+      transitionDuration: 0,
+      // 性能：鼠标移动节流间隔（ms），降低高频重绘
+      showDelay: 0,
+      hideDelay: 50,
+      axisPointer: {
+        type: "cross",
+        label: { backgroundColor: "#1f2937" },
+        // 性能：cross 指针实时联动开销大，改为仅 x 轴吸附 + snap
+        snap: true,
+        animation: false,
+      },
+      // 性能：大数据量下限制 tooltip 内容渲染频率
+      throttle: 50,
       formatter: ps => {
         // 按系列名去重（axisPointer 落在两点之间时同系列可能重复出现）
         const seen = new Set();
@@ -443,7 +457,16 @@ function renderChart() {
           if (seen.has(p.seriesName)) return false;
           seen.add(p.seriesName);
           return true;
-        }).sort((a, b) => a.seriesName.localeCompare(b.seriesName, undefined, { numeric: true, sensitivity: "base" }));
+        });
+        // 排序结果缓存：系列名集合不变时复用上次排序（避免每次 mousemove 都 localeCompare）
+        const key = items.map(p => p.seriesName).join("\u0001");
+        if (formatterCache._key !== key) {
+          items.sort((a, b) => a.seriesName.localeCompare(b.seriesName, undefined, { numeric: true, sensitivity: "base" }));
+          formatterCache._key = key;
+        } else {
+          items.sort((a, b) => formatterCache._order.indexOf(a.seriesName) - formatterCache._order.indexOf(b.seriesName));
+        }
+        formatterCache._order = items.map(p => p.seriesName);
         let s = `<b>${fmtTFull(items[0].value[0])}</b><br>`;
         items.forEach(p => s += `${p.marker} ${esc(p.seriesName)}: <b>${p.value[1] ?? "-"}</b><br>`);
         return s;
