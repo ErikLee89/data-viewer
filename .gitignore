@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# 运行时数据与缓存
+data/cache/
+data/uistate/
+data/session.json
+data/*.parquet
+data/meta.json
+
+# 截图/日志
+shots/
+*.log

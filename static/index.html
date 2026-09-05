@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>数据查看器</title>
+<script src="/static/echarts.min.js"></script>
+<script src="/static/js/dayjs.min.js"></script>
+<script src="/static/js/dayjs-utc.min.js"></script>
+<script>dayjs.extend(dayjs_plugin_utc);</script>
+<style>
+:root {
+  --bg: #f5f7fa; --card: #fff; --border: #e5e7eb;
+  --primary: #1677ff; --text: #1f2937; --text2: #6b7280;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { height: 100%; }
+body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background: var(--bg); color: var(--text); font-size: 14px; display:flex; flex-direction:column; overflow:hidden; }
+
+/* 顶栏 */
+.topbar { background:#fff; border-bottom:1px solid var(--border); padding:10px 16px; display:flex; align-items:center; gap:12px; flex-shrink:0; }
+.topbar h1 { font-size:16px; font-weight:600; }
+.topbar .file-title { font-size:15px; font-weight:600; color:var(--text); flex:1; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.topbar .file-info { font-size:12px; color:var(--text2); text-align:right; line-height:1.4; }
+.btn { padding:7px 16px; border:1px solid var(--primary); background:var(--primary); color:#fff; border-radius:6px; font-size:13px; cursor:pointer; }
+.btn:hover { background:#3c8dff; }
+.btn.ghost { background:#fff; color:var(--primary); }
+.btn.ghost:hover { background:#f0f7ff; }
+.btn:disabled { opacity:.5; cursor:not-allowed; }
+
+/* 主区 */
+.main { flex:1; display:flex; min-height:0; }
+.chart-panel { flex:1; display:flex; flex-direction:column; min-width:0; background:#fff; }
+#chart { flex:1; min-height:0; }
+
+/* 右侧列选择 */
+.sidebar { width:280px; border-left:1px solid var(--border); background:#fff; display:flex; flex-direction:column; flex-shrink:0; }
+.sidebar .head { padding:10px 14px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; }
+.sidebar .head b { font-size:13px; }
+.sidebar .head .count { font-size:11px; color:var(--text2); margin-left:auto; }
+.sidebar .tools { padding:8px 14px; display:flex; gap:8px; border-bottom:1px solid var(--border); }
+.sidebar .tools a { font-size:12px; color:var(--primary); cursor:pointer; text-decoration:none; }
+.sidebar .tools a:hover { text-decoration:underline; }
+#cols { flex:1; overflow-y:auto; padding:6px 0; }
+.col-item { display:flex; align-items:center; gap:8px; padding:4px 14px; cursor:pointer; user-select:none; }
+.col-item:hover { background:#f5f8ff; }
+.col-item input[type=checkbox] { accent-color: var(--primary); cursor:pointer; flex-shrink:0; }
+.col-item .name { font-size:13px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.col-item .name input { width:100%; font-size:13px; border:1px solid var(--primary); border-radius:4px; padding:2px 4px; outline:none; }
+.col-item .unit { font-size:11px; color:var(--text2); flex-shrink:0; }
+.col-item .rename-btn { font-size:11px; color:var(--text2); cursor:pointer; flex-shrink:0; padding:2px 4px; border-radius:3px; visibility:hidden; }
+.col-item:hover .rename-btn { visibility:visible; }
+.col-item .rename-btn:hover { color:var(--primary); background:#eef4ff; }
+.col-item.locked { color:var(--text2); cursor:default; }
+.col-item.locked:hover { background:none; }
+
+/* 空状态 */
+.empty { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; color:var(--text2); }
+.empty .icon { font-size:48px; opacity:.4; }
+.empty .tip { font-size:13px; line-height:1.8; text-align:center; }
+
+/* 加载遮罩（居中显示状态 + 服务端实时日志） */
+#loading { position:fixed; inset:0; background:rgba(255,255,255,.92); display:none; align-items:center; justify-content:center; z-index:98; font-size:14px; color:var(--text2); flex-direction:column; gap:14px; }
+.spinner { width:36px; height:36px; border:3px solid #d9e5ff; border-top-color:var(--primary); border-radius:50%; animation:spin 1s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+#loading-text { font-size:15px; color:var(--text); font-weight:500; }
+#loading-bar { display:none; width:340px; height:6px; background:#e5e7eb; border-radius:3px; overflow:hidden; }
+#loading-bar div { height:100%; width:0; background:var(--primary); border-radius:3px; transition:width .2s; }
+#loading-logs { display:none; max-width:560px; padding:10px 16px; background:#f8fafc; border:1px solid var(--border); border-radius:8px; font-family:Consolas, monospace; font-size:12px; line-height:1.9; color:var(--text2); max-height:180px; overflow-y:auto; }
+#loading-logs .t { color:#9ca3af; margin-right:8px; }
+#loading-logs .m { white-space:pre-wrap; }
+
+/* toast */
+#toast { position:fixed; top:60px; left:50%; transform:translateX(-50%); background:#333; color:#fff; padding:10px 20px; border-radius:6px; font-size:13px; display:none; z-index:99; }
+#loading { position:fixed; inset:0; background:rgba(255,255,255,.85); display:none; align-items:center; justify-content:center; z-index:98; font-size:14px; color:var(--text2); flex-direction:column; gap:12px; }
+.spinner { width:32px; height:32px; border:3px solid #d9e5ff; border-top-color:var(--primary); border-radius:50%; animation:spin 1s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+#loading-bar { display:none; width:320px; height:6px; background:#e5e7eb; border-radius:3px; overflow:hidden; }
+#loading-bar div { height:100%; width:0; background:var(--primary); border-radius:3px; transition:width .2s; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <button class="btn" id="btn-open" onclick="pickFile()">选择数据文件</button>
+  <div class="file-title" id="file-title">未加载文件</div>
+  <button class="btn ghost" id="btn-export" onclick="exportPNG()" disabled>导出图片</button>
+  <div class="file-info" id="file-info"></div>
+</div>
+
+<div class="main">
+  <div class="chart-panel">
+    <div id="chart"></div>
+  </div>
+  <div class="sidebar">
+    <div class="head"><b>数据列</b><span class="count" id="col-count"></span></div>
+    <div class="tools">
+      <a onclick="selectAll(true)">全选</a>
+      <a onclick="selectAll(false)">全不选</a>
+      <a onclick="resetZoom()">重置缩放</a>
+    </div>
+    <div id="cols"></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+<div id="loading">
+  <div class="spinner"></div>
+  <div id="loading-text">加载中...</div>
+  <div id="loading-bar"><div></div></div>
+  <div id="loading-logs"></div>
+</div>
+
+<script>
+"use strict";
+
+const PALETTE = ["#1677ff","#52c41a","#fa8c16","#f5222d","#722ed1","#13c2c2","#eb2f96","#a0d911","#faad14","#ff7a45","#9254de","#597ef7","#36cfc9","#ff85c0","#95de64","#ffc53d"];
+let chart;
+let DATA = null;          // {t:[], cols:{name:{v:[],unit,desc}}, tCol, file}
+let selected = new Set(); // 已选列名
+let FILE_HASH = null;     // 当前文件 SHA-256
+let colNames = {};        // 列名重命名映射 {原始名: 显示名}
+let saveTimer = null;     // UI 状态防抖保存
+let logCursor = -1;       // 日志轮询游标
+let logPolling = false;   // 防止轮询堆积
+let loadGen = 0;           // 加载代际（防止会话恢复与手动上传竞争）
+
+function toast(msg, ms=2500) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.style.display = "block";
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", ms);
+}
+function showLoading(on, text, pct) {
+  const el = document.getElementById("loading");
+  el.style.display = on ? "flex" : "none";
+  if (text != null) document.getElementById("loading-text").textContent = text;
+  const bar = document.getElementById("loading-bar");
+  if (pct != null && pct >= 0) {
+    bar.style.display = "block";
+    bar.firstElementChild.style.width = pct + "%";
+  } else {
+    bar.style.display = "none";
+  }
+  if (!on) {
+    // 关闭时清空日志区
+    document.getElementById("loading-logs").style.display = "none";
+    document.getElementById("loading-logs").innerHTML = "";
+  }
+}
+function fmtT(ms) { return dayjs(ms).utc().format("MM-DD HH:mm"); }
+function fmtTFull(ms) { return dayjs(ms).utc().format("YYYY-MM-DD HH:mm:ss"); }
+
+// ---------- 文件选择 ----------
+function pickFile() {
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = ".xlsx,.xls,.csv";
+  inp.onchange = () => { if (inp.files[0]) loadFile(inp.files[0]); };
+  inp.click();
+}
+
+async function loadFile(file) {
+  const gen = ++loadGen;   // 本次加载的代际
+  const totalMB = (file.size / 1024 / 1024).toFixed(1);
+  try {
+    // --- 0. 算文件 SHA-256，查缓存 ---
+    showLoading(true, "计算文件特征值...");
+    const buf = await file.arrayBuffer();
+    const digest = await crypto.subtle.digest("SHA-256", buf);
+    const hash = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+    FILE_HASH = hash;
+    let data = null;
+    try {
+      const r = await fetch("/api/cache/" + hash);
+      if (r.ok) {
+        showLoading(true, "缓存命中，加载中...");
+        data = await r.json();
+        if (gen !== loadGen) return;   // 已有新加载，放弃本次
+        toast("已从缓存加载（免上传免解析）");
+      }
+    } catch (e) { /* 缓存查询失败则正常上传 */ }
+
+    if (!data) {
+      // --- 1. 上传（XHR 带进度）---
+      showLoading(true, `正在上传 ${file.name} (${totalMB} MB)...`, 0);
+      data = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        const fd = new FormData();
+        fd.append("file", new File([buf], file.name));
+        xhr.open("POST", "/api/upload2");
+        xhr.responseType = "json";
+        xhr.upload.onprogress = e => {
+          if (e.lengthComputable) {
+            const pct = Math.round(e.loaded / e.total * 100);
+            showLoading(true, `正在上传 ${file.name} (${totalMB} MB)... ${pct}%`, pct);
+          }
+        };
+        xhr.upload.onload = () => showLoading(true, "服务端解析中（读取 Excel → 识别表头/时间列 → 提取数值列）...", 100);
+        xhr.onload = () => {
+          if (gen !== loadGen) { reject(new Error("已取消")); return; }
+          if (xhr.status === 200) resolve(xhr.response);
+          else reject(new Error(xhr.response?.detail || `服务端错误 ${xhr.status}`));
+        };
+        xhr.onerror = () => reject(new Error("网络错误"));
+        xhr.send(fd);
+      });
+    }
+    showLoading(true, "正在绘制曲线...");
+    DATA = data;
+    await loadUIState();   // 恢复列名/选中列/缩放状态
+    afterLoad();
+  } catch (e) {
+    toast("加载失败: " + e.message, 4000);
+  } finally {
+    showLoading(false);
+  }
+}
+
+// ---------- UI 状态持久化（列名/选中列/缩放） ----------
+async function loadUIState() {
+  colNames = {};
+  selected = new Set();
+  window.__restoreZoom = null;
+  if (!FILE_HASH) return;
+  try {
+    const r = await fetch(`/api/uistate/${FILE_HASH}`);
+    if (r.ok) {
+      const st = await r.json();
+      colNames = st.colNames || {};
+      const names = Object.keys(DATA.cols);
+      if (st.selected && st.selected.length) {
+        selected = new Set(st.selected.filter(n => names.includes(n)));
+      }
+      if (st.zoom && st.zoom.length === 2) window.__restoreZoom = st.zoom;
+    }
+  } catch (e) { /* 无状态则用默认 */ }
+}
+
+function saveUIState() {
+  if (!FILE_HASH || !DATA) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(doSaveUIState, 600);
+}
+
+async function doSaveUIState(useBeacon) {
+  if (!FILE_HASH || !DATA) return;
+  let zoom = null;
+  try {
+    const o = chart.getOption();
+    const dz = o.dataZoom && o.dataZoom[1];
+    if (dz && dz.start != null) zoom = [dz.start, dz.end];
+  } catch (e) {}
+  const payload = JSON.stringify({
+    file: DATA.file,
+    colNames,
+    selected: [...selected],
+    zoom,
+  });
+  try {
+    if (useBeacon) {
+      // 页面关闭场景：sendBeacon 不保证 Content-Type 为 json，后端兼容 text/plain
+      navigator.sendBeacon(`/api/uistate/${FILE_HASH}?beacon=1`, new Blob([payload], { type: "text/plain" }));
+    } else {
+      await fetch(`/api/uistate/${FILE_HASH}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload,
+      });
+    }
+  } catch (e) { /* 保存失败静默 */ }
+}
+
+// 页面关闭前立即保存（防抖未触发时不丢状态）
+window.addEventListener("beforeunload", () => {
+  if (saveTimer) doSaveUIState(true);
+});
+
+function afterLoad() {
+  const names = Object.keys(DATA.cols);
+  // 默认不选任何列；有保存状态则已恢复
+  if (!selected.size) selected = new Set();
+  renderSidebar();
+  document.getElementById("file-title").textContent = DATA.file;
+  document.getElementById("file-info").innerHTML =
+    `${DATA.rows.toLocaleString()} 行 · ${names.length} 列 · 时间列: ${DATA.tCol}`;
+  document.getElementById("btn-export").disabled = false;
+  renderChart();
+}
+
+// ---------- 侧栏 ----------
+function displayName(n) { return colNames[n] || n; }
+
+function renderSidebar() {
+  const box = document.getElementById("cols");
+  const names = Object.keys(DATA.cols);
+  document.getElementById("col-count").textContent = `${selected.size}/${names.length}`;
+  box.innerHTML = names.map(n => {
+    const c = DATA.cols[n];
+    const on = selected.has(n);
+    return `<label class="col-item">
+      <input type="checkbox" ${on ? "checked" : ""} onchange="toggleCol('${esc(n)}', this.checked)">
+      <span class="name" title="${esc(n)}${c.desc ? " · " + esc(c.desc) : ""}" ondblclick="renameCol('${esc(n)}', this)">${esc(displayName(n))}</span>
+      ${c.unit ? `<span class="unit">${esc(c.unit)}</span>` : ""}
+      <span class="rename-btn" onclick="renameCol('${esc(n)}', this.parentElement.querySelector('.name'))">改名</span>
+    </label>`;
+  }).join("");
+}
+
+function renameCol(n, el) {
+  if (!el) return;
+  const orig = displayName(n);
+  el.innerHTML = `<input type="text" value="${esc(orig)}">`;
+  const inp = el.querySelector("input");
+  inp.focus();
+  inp.select();
+  const commit = () => {
+    const v = inp.value.trim();
+    if (v && v !== n) colNames[n] = v;
+    else delete colNames[n];
+    renderSidebar();
+    renderChart();
+    saveUIState();
+  };
+  inp.onblur = commit;
+  inp.onkeydown = e => {
+    if (e.key === "Enter") inp.blur();
+    if (e.key === "Escape") { inp.onblur = null; renderSidebar(); }
+  };
+  inp.onclick = e => e.stopPropagation();
+}
+function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/'/g,"&#39;").replace(/"/g,"&quot;"); }
+function toggleCol(name, on) {
+  if (on) selected.add(name); else selected.delete(name);
+  renderChart();
+  document.getElementById("col-count").textContent = `${selected.size}/${Object.keys(DATA.cols).length}`;
+  saveUIState();
+}
+function selectAll(on) {
+  const names = Object.keys(DATA.cols);
+  selected = on ? new Set(names) : new Set();
+  renderSidebar(); renderChart();
+  saveUIState();
+}
+function resetZoom() {
+  if (chart) chart.dispatchAction({ type: "dataZoom", start: 0, end: 100 });
+}
+
+// ---------- 主图（K线式缩放：底部滑块可拖动/边缘缩放，主图滚轮缩放） ----------
+function renderChart() {
+  if (!chart) chart = echarts.init(document.getElementById("chart"));
+  const t = DATA.t;
+  const series = [...selected].map((n, i) => {
+    const c = DATA.cols[n];
+    return {
+      name: displayName(n), type: "line", showSymbol: false,
+      data: c.v.map((v, j) => [t[j], v]),
+      lineStyle: { width: 1.4 }, itemStyle: { color: PALETTE[i % PALETTE.length] },
+    };
+  });
+  // 保留当前缩放状态（勾选列时不重置）
+  let keepZoom = null;
+  if (chart.getOption) {
+    try {
+      const o = chart.getOption();
+      const dz = o.dataZoom && o.dataZoom[1];
+      if (dz && dz.start != null) keepZoom = [dz.start, dz.end];
+    } catch (e) {}
+  }
+  const opt = {
+    animation: false,
+    tooltip: {
+      trigger: "axis",
+      axisPointer: { type: "cross", label: { backgroundColor: "#1f2937" } },
+      formatter: ps => {
+        // 按系列名去重（axisPointer 落在两点之间时同系列可能重复出现）
+        const seen = new Set();
+        const items = ps.filter(p => {
+          if (seen.has(p.seriesName)) return false;
+          seen.add(p.seriesName);
+          return true;
+        }).sort((a, b) => a.seriesName.localeCompare(b.seriesName, undefined, { numeric: true, sensitivity: "base" }));
+        let s = `<b>${fmtTFull(items[0].value[0])}</b><br>`;
+        items.forEach(p => s += `${p.marker} ${esc(p.seriesName)}: <b>${p.value[1] ?? "-"}</b><br>`);
+        return s;
+      },
+    },
+    legend: { top: 4, type: "scroll", textStyle: { fontSize: 11 } },
+    grid: { left: 64, right: 24, top: 40, bottom: 78 },
+    xAxis: {
+      type: "time",
+      axisLabel: { formatter: v => fmtT(v) },
+    },
+    yAxis: { type: "value", scale: true },
+    dataZoom: [
+      { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true },
+      {
+        type: "slider", xAxisIndex: 0, bottom: 14, height: 46,
+        borderColor: "#d9d9d9", fillerColor: "rgba(22,119,255,0.14)",
+        handleStyle: { color: "#1677ff" }, moveHandleStyle: { color: "#1677ff" },
+        dataBackground: { lineStyle: { color: "#b8c8e8", width: 1 }, areaStyle: { color: "rgba(22,119,255,0.08)" } },
+        selectedDataBackground: { lineStyle: { color: "#1677ff", width: 1 }, areaStyle: { color: "rgba(22,119,255,0.18)" } },
+        labelFormatter: v => fmtT(v),
+        brushSelect: false,
+      },
+    ],
+    series,
+  };
+  // 恢复缩放：优先用 uistate 恢复值，否则保留当前视图
+  if (window.__restoreZoom) {
+    const [s, e] = window.__restoreZoom;
+    opt.dataZoom[0].start = s; opt.dataZoom[0].end = e;
+    opt.dataZoom[1].start = s; opt.dataZoom[1].end = e;
+    window.__restoreZoom = null;
+  } else if (keepZoom) {
+    opt.dataZoom[0].start = keepZoom[0]; opt.dataZoom[0].end = keepZoom[1];
+    opt.dataZoom[1].start = keepZoom[0]; opt.dataZoom[1].end = keepZoom[1];
+  }
+  chart.setOption(opt, true);
+  // 缩放变化 → 保存状态
+  if (!chart._zoomBound) {
+    chart._zoomBound = true;
+    chart.on("datazoom", () => saveUIState());
+    bindSliderTooltip();
+  }
+}
+
+// ---------- 时间轴滑块悬停显示时间 ----------
+function bindSliderTooltip() {
+  // 自建 tooltip div（滑块区域鼠标跟随）
+  const tip = document.createElement("div");
+  tip.style.cssText = "position:fixed;z-index:99;display:none;pointer-events:none;background:#1f2937;color:#fff;padding:4px 10px;border-radius:4px;font-size:12px;font-family:Consolas,monospace;white-space:nowrap;";
+  document.body.appendChild(tip);
+
+  chart.getZr().on("mousemove", e => {
+    const c = chart;
+    const chartEl = document.getElementById("chart");
+    const rect = chartEl.getBoundingClientRect();
+    // 滑块区域：grid 底部以下（bottom=78 预留）到图表底部
+    const grid = c.getModel().getComponent("grid");
+    const gRect = grid.coordinateSystem.getRect();
+    const gridBottomPx = gRect.y + gRect.height;   // grid 底部（图表内坐标）
+    const yIn = e.offsetY;
+    const xIn = e.offsetX;
+    // 滑块范围：gridBottomPx ~ chartH（含 slider），x 在 grid 内
+    const inSlider = yIn > gridBottomPx && yIn < c.getHeight() && xIn >= gRect.x && xIn <= gRect.x + gRect.width;
+    if (inSlider) {
+      // 像素 → 时间值（用主 xAxis，含当前缩放）
+      const t = c.convertFromPixel({ xAxisIndex: 0 }, xIn);
+      if (t && isFinite(t)) {
+        tip.textContent = fmtTFull(t);
+        tip.style.display = "block";
+        tip.style.left = (rect.left + xIn + 14) + "px";
+        tip.style.top = (rect.top + yIn - 30) + "px";
+        return;
+      }
+    }
+    tip.style.display = "none";
+  });
+  chart.getZr().on("mouseout", () => { tip.style.display = "none"; });
+}
+
+// ---------- 服务端日志 → 加载遮罩中央实时显示 ----------
+async function pollLogs() {
+  if (logPolling) return;   // 上一轮未完成，跳过防堆积
+  logPolling = true;
+  try {
+    const r = await fetch(`/api/logs?after=${logCursor}`, { cache: "no-store" });
+    if (r.ok) {
+      const d = await r.json();
+      if (d.items.length) {
+        const box = document.getElementById("loading-logs");
+        // 仅在加载遮罩显示中才展示
+        if (document.getElementById("loading").style.display === "flex") {
+          box.style.display = "block";
+          box.insertAdjacentHTML("beforeend", d.items.map(l =>
+            `<div><span class="t">${l.t}</span><span class="m">${esc(l.m)}</span></div>`
+          ).join(""));
+          box.scrollTop = box.scrollHeight;
+        }
+      }
+      logCursor = d.next;
+    }
+  } catch (e) {} finally {
+    logPolling = false;
+  }
+}
+
+// ---------- 会话恢复 ----------
+async function tryRestoreSession() {
+  try {
+    const r = await fetch("/api/session", { cache: "no-store" });
+    if (!r.ok) return;
+    const s = await r.json();
+    if (!s.has) return;
+    // 有可恢复会话 → 弹窗提示并恢复
+    showLoading(true, `正在恢复上次数据: ${s.file}`, null);
+    const r2 = await fetch("/api/session/restore", { cache: "no-store" });
+    if (!r2.ok) { if (loadGen === 0) showLoading(false); return; }
+    const data = await r2.json();
+    if (loadGen !== 0) return;   // 用户已手动加载新文件，放弃恢复（不动遮罩，由 loadFile 管理）
+    DATA = data;
+    FILE_HASH = s.hash;
+    await loadUIState();
+    if (loadGen !== 0) return;
+    afterLoad();
+    showLoading(false);
+    toast(`已恢复上次数据: ${s.file}`);
+  } catch (e) {
+    if (loadGen === 0) showLoading(false);
+  }
+}
+
+// ---------- 启动 ----------
+pollLogs();
+setInterval(pollLogs, 1000);
+tryRestoreSession();
+
+// ---------- 导出 ----------
+function exportPNG() {
+  if (!chart) return;
+  const url = chart.getDataURL({ type: "png", pixelRatio: 2, backgroundColor: "#fff" });
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = (DATA ? DATA.file.replace(/\.(xlsx|xls)$/i, "") : "chart") + "_" + fmtT(Date.now()).replace(/[ :]/g, "") + ".png";
+  a.click();
+  toast("已导出 PNG");
+}
+
+window.addEventListener("resize", () => { chart && chart.resize(); });
+</script>
+</body>
+</html>
