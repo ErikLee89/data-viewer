@@ -59,5 +59,3 @@
 ```bash
 pip install fastapi uvicorn pandas numpy pyarrow openpyxl python-multipart python-calamine
 ```
-
-（本机均已安装）
