@@ -389,12 +389,35 @@ function unwrapSeries(name) {
 function renderChart() {
   if (!chart) chart = echarts.init(document.getElementById("chart"));
   const t = DATA.t;
+  // 先判断是否存在角度列（决定副轴），再构建系列
+  const angleCols = [...selected].filter(n => isAngleCol(n));
+  const hasAngle = angleCols.length > 0;
+  // 多条角度列对齐：以第一条为基准，其余整体平移 360 的倍数，使中位数最接近基准
+  // （否则一条在 0° 附近、另一条在 360° 附近，物理同向却相距一圈）
+  let baseMed = null;
+  const angleShift = {};
+  if (angleCols.length > 1) {
+    const med = a => {
+      const vs = a.filter(v => v != null).sort((x, y) => x - y);
+      if (!vs.length) return null;
+      return vs[Math.floor(vs.length / 2)];
+    };
+    baseMed = med(unwrapSeries(angleCols[0]));
+    if (baseMed != null) {
+      for (const n of angleCols.slice(1)) {
+        const m = med(unwrapSeries(n));
+        if (m != null) angleShift[n] = 360 * Math.round((baseMed - m) / 360);
+      }
+    }
+  }
   const series = [...selected].map((n, i) => {
     const c = DATA.cols[n];
     const angle = isAngleCol(n);
-    const vals = angle ? unwrapSeries(n) : c.v;
+    let vals = angle ? unwrapSeries(n) : c.v;
+    if (angle && angleShift[n]) vals = vals.map(v => v == null ? null : v + angleShift[n]);
     return {
       name: displayName(n) + (angle ? " (展开)" : ""), type: "line", showSymbol: false,
+      yAxisIndex: angle ? 1 : 0,
       data: vals.map((v, j) => [t[j], v]),
       lineStyle: { width: 1.4 }, itemStyle: { color: PALETTE[i % PALETTE.length] },
     };
@@ -427,12 +450,22 @@ function renderChart() {
       },
     },
     legend: { top: 4, type: "scroll", textStyle: { fontSize: 11 } },
-    grid: { left: 64, right: 24, top: 40, bottom: 78 },
+    grid: { left: 64, right: hasAngle ? 72 : 24, top: 40, bottom: 78 },
     xAxis: {
       type: "time",
       axisLabel: { formatter: v => fmtT(v) },
     },
-    yAxis: { type: "value", scale: true },
+    yAxis: [
+      { type: "value", scale: true },
+      // 副轴：角度列专用（展开后的连续值）
+      ...(hasAngle ? [{
+        type: "value", scale: true, name: "角度°(展开)",
+        nameTextStyle: { color: "#722ed1", fontSize: 11 },
+        axisLine: { show: true, lineStyle: { color: "#722ed1" } },
+        splitLine: { show: false },
+        axisLabel: { color: "#722ed1", formatter: v => Math.round(v) + "°" },
+      }] : []),
+    ],
     dataZoom: [
       { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true },
       {
