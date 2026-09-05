@@ -16,13 +16,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from metadata import COLUMNS, GROUPS, KNOWN_ISSUES
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-PARQUET = os.path.join(DATA_DIR, "data.parquet")
-META = os.path.join(DATA_DIR, "meta.json")
 
 app = FastAPI(title="数据查看器")
 
@@ -51,411 +46,44 @@ def _log(msg: str):
 
 
 
-_df: pd.DataFrame | None = None
-_meta: dict | None = None
-
-
-def get_df() -> pd.DataFrame:
-    global _df
-    if _df is None:
-        if not os.path.exists(PARQUET):
-            raise HTTPException(500, "data/data.parquet 不存在，请先运行 import_data.py")
-        _df = pd.read_parquet(PARQUET)
-    return _df
-
-
-def get_meta() -> dict:
-    global _meta
-    if _meta is None:
-        if os.path.exists(META):
-            with open(META, encoding="utf-8") as f:
-                _meta = json.load(f)
-        else:
-            _meta = {}
-    return _meta
-
-
-# ---------- 工具 ----------
-def ts_to_unix(v):
-    """utc 列 → unix 秒"""
-    if isinstance(v, (pd.Timestamp, datetime.datetime)):
-        return int(v.timestamp())
-    return None
-
-
-def resample(df: pd.DataFrame, cols: list[str], t0: int, t1: int, step: int, agg="mean"):
-    """按 step 秒聚合。返回 {col: {t:[], v:[]}}"""
-    sub = df[(df["unix time"] >= t0) & (df["unix time"] <= t1)]
-    if len(sub) == 0:
-        return {}
-    out = {}
-    n = len(sub)
-    # 目标点数上限 5000
-    max_pts = 5000
-    actual_step = step
-    while (t1 - t0) / actual_step > max_pts:
-        actual_step *= 2
-    bins = ((sub["unix time"] - t0) // actual_step).astype(int)
-    g = sub.groupby(bins)
-    for c in cols:
-        if c not in sub.columns:
-            continue
-        s = g[c]
-        if agg == "mean":
-            v = s.mean()
-        elif agg == "max":
-            v = s.max()
-        elif agg == "min":
-            v = s.min()
-        else:
-            v = s.mean()
-        out[c] = {
-            "t": (v.index * actual_step + t0).tolist(),
-            "v": [None if pd.isna(x) else round(float(x), 4) for x in v.tolist()],
-        }
-    out["_step"] = actual_step
-    return out
-
-
-# ---------- API ----------
-@app.get("/api/meta")
-def api_meta():
-    m = get_meta()
-    return {
-        "rows": m.get("rows"),
-        "t_start": m.get("t_start"),
-        "t_end": m.get("t_end"),
-        "duration_hours": m.get("duration_hours"),
-        "source_file": m.get("source_file"),
-        "import_time": m.get("import_time"),
-        "columns": m.get("columns", {}),
-        "derived_columns": m.get("derived_columns", {}),
-        "known_issues": m.get("known_issues", {}),
-        "cam_note": m.get("cam_note", ""),
-        "me_pwr_note": m.get("me_pwr_note", ""),
-        "groups": GROUPS,
-    }
-
-
-@app.get("/api/overview")
-def api_overview():
-    """总览页：KPI + 1分钟降采样关键曲线 + 状态分段"""
-    df = get_df()
-    t0 = int(df["unix time"].iloc[0])
-    t1 = int(df["unix time"].iloc[-1])
-
-    # KPI
-    rotor_on_frac = float(df["ROTOR_ON"].mean())
-    cam_on_frac = float(df["VESSEL.STAT1.CAM"].mean())
-    sys_run_frac = float(df["VESSEL.STAT0_SYS.RUNNING"].mean())
-    sog_mean = float(df["VESSEL.SOG"].mean())
-    tws_mean = float(df["TWS"].mean())
-    foc_me_mean = float(df["PMS.FOC.ME"].mean())
-    sfoc_mean = float(df["SFOC"].mean())
-    dist_nm = float(df["VESSEL.SOG"].sum() / 3600)  # kn·s → nm
-    rotor_pwr_mean = float(df["ROTOR_PWR_TOT"].mean())
-
-    # 关键曲线 1min
-    cols = ["VESSEL.SOG", "PMS.FOC.ME", "ME.PWR_cal", "TWS", "AN1.AWS", "ROTOR_N", "ROTOR_PWR_TOT", "VESSEL.RA1"]
-    curves = resample(df, cols, t0, t1, 60)
-
-    # 状态分段（ROTOR_ON 变化 + SYS.RUNNING 变化，段长>60s）
-    seg_key = (df["ROTOR_ON"].astype(int) * 2 + df["VESSEL.STAT0_SYS.RUNNING"].astype(int)).to_numpy()
-    change = np.where(np.diff(seg_key) != 0)[0]
-    starts = np.concatenate([[0], change + 1])
-    ends = np.concatenate([change, [len(seg_key) - 1]])
-    segs = []
-    ut = df["unix time"].to_numpy()
-    for s, e in zip(starts, ends):
-        dur = int(ut[e] - ut[s])
-        if dur < 60:
-            continue
-        segs.append({
-            "t0": int(ut[s]), "t1": int(ut[e]), "dur_min": round(dur / 60, 1),
-            "rotor_on": bool(seg_key[s] >= 2), "sys_run": bool(seg_key[s] % 2 == 1),
-        })
-    # 合并相邻同状态短段
-    merged = []
-    for s in segs:
-        if merged and merged[-1]["rotor_on"] == s["rotor_on"] and merged[-1]["sys_run"] == s["sys_run"]:
-            merged[-1]["t1"] = s["t1"]
-            merged[-1]["dur_min"] = round((s["t1"] - merged[-1]["t0"]) / 60, 1)
-        else:
-            merged.append(s)
-
-    return {
-        "kpi": {
-            "rotor_on_frac": round(rotor_on_frac, 3),
-            "cam_on_frac": round(cam_on_frac, 3),
-            "sys_run_frac": round(sys_run_frac, 3),
-            "sog_mean": round(sog_mean, 2),
-            "tws_mean": round(tws_mean, 2),
-            "foc_me_mean": round(foc_me_mean, 1),
-            "sfoc_mean": round(sfoc_mean, 1),
-            "dist_nm": round(dist_nm, 1),
-            "rotor_pwr_mean": round(rotor_pwr_mean, 1),
-        },
-        "curves": curves,
-        "segments": merged,
-    }
-
-
-@app.get("/api/timeseries")
-def api_timeseries(
-    cols: str = Query(..., description="逗号分隔列名"),
-    t0: int = Query(...),
-    t1: int = Query(...),
-    step: int = Query(60, description="聚合步长(秒)"),
-    agg: str = Query("mean"),
-):
-    df = get_df()
-    col_list = [c.strip() for c in cols.split(",") if c.strip()]
-    for c in col_list:
-        if c not in df.columns:
-            raise HTTPException(400, f"未知列: {c}")
-    return resample(df, col_list, t0, t1, step, agg)
-
-
-@app.get("/api/track")
-def api_track(step: int = Query(60)):
-    """航迹：降采样经纬度 + 状态/指标"""
-    df = get_df()
-    t0 = int(df["unix time"].iloc[0])
-    t1 = int(df["unix time"].iloc[-1])
-    cols = ["LAT_DEC", "LON_DEC", "VESSEL.SOG", "PMS.FOC.ME", "TWS", "ROTOR_ON", "VESSEL.HDT", "VESSEL.COG"]
-    r = resample(df, cols, t0, t1, step)
-    return r
-
-
-@app.get("/api/cam")
-def api_cam():
-    """CAM 对比分析：旋筒开/关时段自动分段 → 配对 → 指标对比"""
-    df = get_df()
-    ut = df["unix time"].to_numpy()
-    rotor = df["ROTOR_ON"].to_numpy().astype(int)
-    sysr = df["VESSEL.STAT0_SYS.RUNNING"].to_numpy().astype(int)
-
-    # 分段：ROTOR_ON 且 SYS.RUNNING=1 为 ON 段；ROTOR_OFF 且 SYS.RUNNING=1 为 OFF 段
-    state = np.where(sysr == 1, rotor, 2)  # 2=系统停机
-    change = np.where(np.diff(state) != 0)[0]
-    starts = np.concatenate([[0], change + 1])
-    ends = np.concatenate([change, [len(state) - 1]])
-
-    MIN_SEG = 600  # 最短10分钟
-    segs = []
-    for s, e in zip(starts, ends):
-        dur = int(ut[e] - ut[s])
-        if dur < MIN_SEG or state[s] == 2:
-            continue
-        segs.append({"t0": int(ut[s]), "t1": int(ut[e]), "dur_min": round(dur / 60, 1), "on": bool(state[s] == 1)})
-
-    # 段指标
-    def seg_metrics(s, e):
-        sub = df.iloc[s:e+1]
-        sog = float(sub["VESSEL.SOG"].mean())
-        foc = float(sub["PMS.FOC.ME"].mean())
-        m = {
-            "sog": sog,
-            "foc_me": foc,
-            "foc_tot": float(sub["PMS.FOC.TOT"].mean()),
-            "me_pwr": float(sub["ME.PWR_cal"].mean()),
-            "tws": float(sub["TWS"].mean()),
-            "twa": float(sub["TWA"].mean()),
-            "aws": float(sub["AN1.AWS"].mean()),
-            "sfoc": float(sub["SFOC"].mean()),
-            "rotor_pwr": float(sub["ROTOR_PWR_TOT"].mean()),
-            "hdt": float(sub["VESSEL.HDT"].mean()),
-            "roll": float(sub["VESSEL.RA1"].abs().mean()),
-            # 恒转速测试下正确指标：单位距离油耗 kg/nm（含风帆白耗电折算可选）
-            "foc_per_nm": foc / sog if sog > 1 else None,
-            "foc_tot_per_nm": float(sub["PMS.FOC.TOT"].mean()) / sog if sog > 1 else None,
-        }
-        return {k: (round(v, 3) if v is not None else None) for k, v in m.items()}
-
-    for seg in segs:
-        # 找到对应行范围
-        mask = (ut >= seg["t0"]) & (ut <= seg["t1"])
-        idx = np.where(mask)[0]
-        seg["metrics"] = seg_metrics(idx[0], idx[-1])
-
-    # 配对：相邻 ON/OFF 段（前后各1小时内）
-    pairs = []
-    for i, seg in enumerate(segs):
-        if not seg["on"]:
-            continue
-        # 找最近的 OFF 段
-        best = None
-        for j, other in enumerate(segs):
-            if other["on"]:
-                continue
-            gap = min(abs(other["t0"] - seg["t1"]), abs(seg["t0"] - other["t1"]))
-            if gap <= 7200 and (best is None or gap < best[1]):
-                best = (j, gap)
-        if best:
-            off = segs[best[0]]
-            on_m, off_m = seg["metrics"], off["metrics"]
-            pair = {
-                "on_seg": seg, "off_seg": off, "gap_s": best[1],
-                "delta": {
-                    "foc_me": round(on_m["foc_me"] - off_m["foc_me"], 2),
-                    "sog": round(on_m["sog"] - off_m["sog"], 3),
-                    "me_pwr": round(on_m["me_pwr"] - off_m["me_pwr"], 1),
-                    "tws": round(on_m["tws"] - off_m["tws"], 2),
-                    "foc_per_nm": round(on_m["foc_per_nm"] - off_m["foc_per_nm"], 3) if on_m["foc_per_nm"] and off_m["foc_per_nm"] else None,
-                },
-                "saving_pct": round((off_m["foc_me"] - on_m["foc_me"]) / off_m["foc_me"] * 100, 2) if off_m["foc_me"] else None,
-                # 恒转速测试：单位距离油耗节约率（正=节能）
-                "saving_per_nm_pct": round((off_m["foc_per_nm"] - on_m["foc_per_nm"]) / off_m["foc_per_nm"] * 100, 2) if off_m.get("foc_per_nm") and on_m.get("foc_per_nm") else None,
-            }
-            pairs.append(pair)
-
-    return {"segments": segs, "pairs": pairs}
-
-
-@app.get("/api/wind")
-def api_wind():
-    """风况：风玫瑰(真风) + AWA分布 + 传感器一致性"""
-    df = get_df()
-    # 真风玫瑰：TWD 16方位 × TWS 分箱
-    twd = df["TWD"].to_numpy(dtype=float)
-    tws = df["TWS"].to_numpy(dtype=float)
-    valid = ~(np.isnan(twd) | np.isnan(tws))
-    twd, tws = twd[valid], tws[valid]
-    dirs = np.arange(0, 361, 22.5)
-    speed_bins = [0, 3, 6, 9, 12, 15, 20, 100]
-    speed_labels = ["0-3", "3-6", "6-9", "9-12", "12-15", "15-20", ">20"]
-    rose = np.zeros((16, len(speed_labels)))
-    for i in range(16):
-        dmask = (twd >= dirs[i]) & (twd < dirs[i] + 22.5)
-        for j in range(len(speed_labels)):
-            smask = (tws >= speed_bins[j]) & (tws < speed_bins[j + 1])
-            rose[i, j] = np.sum(dmask & smask)
-    rose_list = [{"dir": dirs[i], "counts": rose[i].tolist()} for i in range(16)]
-
-    # AWA 分布（AN1）
-    awa = df["AN1.AWA"].dropna()
-    awa_hist, awa_edges = np.histogram(awa, bins=36, range=(0, 360))
-
-    # 传感器一致性：1min 均值
-    t0 = int(df["unix time"].iloc[0])
-    t1 = int(df["unix time"].iloc[-1])
-    consistency = resample(df, ["AN1.AWS", "AN2.AWS", "MET.AWS", "AN1.AWA", "AN2.AWA", "MET.AWA"], t0, t1, 60)
-
-    # TWA 直方图（真风来向相对艏向）
-    twa = df["TWA"].dropna()
-    twa_hist, twa_edges = np.histogram(twa, bins=36, range=(0, 360))
-
-    return {
-        "rose": rose_list,
-        "speed_labels": speed_labels,
-        "awa_hist": {"counts": awa_hist.tolist(), "edges": awa_edges.tolist()},
-        "twa_hist": {"counts": twa_hist.tolist(), "edges": twa_edges.tolist()},
-        "consistency": consistency,
-        "tws_stats": {
-            "mean": round(float(np.nanmean(tws)), 2),
-            "max": round(float(np.nanmax(tws)), 2),
-            "min": round(float(np.nanmin(tws)), 2),
-        },
-    }
-
-
-@app.get("/api/rotor")
-def api_rotor():
-    """旋筒监控：SP-PV 跟踪 + 驱动功率 + 事件"""
-    df = get_df()
-    t0 = int(df["unix time"].iloc[0])
-    t1 = int(df["unix time"].iloc[-1])
-    cols = []
-    for i in [1, 3, 4, 5]:  # ROT2 停转，跳过
-        cols += [f"ROT{i}.SPD.SP", f"ROT{i}.SPD.PV", f"ROT{i}.DRV.PWR"]
-    curves = resample(df, cols, t0, t1, 60)
-
-    # SP-PV 跟踪误差（1Hz 全量统计）
-    err_stats = {}
-    for i in [1, 3, 4, 5]:
-        sp = df[f"ROT{i}.SPD.SP"].to_numpy(dtype=float)
-        pv = df[f"ROT{i}.SPD.PV"].to_numpy(dtype=float)
-        active = np.abs(sp) > 5
-        err = pv[active] - sp[active]
-        err_stats[f"ROT{i}"] = {
-            "active_frac": round(float(active.mean()), 3),
-            "err_mean": round(float(np.nanmean(err)), 2),
-            "err_std": round(float(np.nanstd(err)), 2),
-            "err_max": round(float(np.nanmax(np.abs(err))), 2),
-        }
-
-    # 启停事件（ROTOR_N 变化）
-    rn = df["ROTOR_N"].to_numpy()
-    ut = df["unix time"].to_numpy()
-    change = np.where(np.diff(rn) != 0)[0]
-    events = []
-    for c in change[:200]:
-        events.append({"t": int(ut[c + 1]), "from": int(rn[c]), "to": int(rn[c + 1])})
-
-    return {"curves": curves, "err_stats": err_stats, "events": events}
-
-
-@app.get("/api/quality")
-def api_quality():
-    """数据质量报告"""
-    df = get_df()
-    issues = []
-    for col, note in KNOWN_ISSUES.items():
-        if col in df.columns:
-            s = df[col]
-            issues.append({
-                "col": col, "note": note,
-                "name": COLUMNS.get(col, {}).get("name", col),
-                "zero_frac": round(float((s == 0).mean()), 4),
-                "nan_frac": round(float(s.isna().mean()), 4),
-                "min": None if pd.isna(s.min()) else round(float(s.min()), 3),
-                "max": None if pd.isna(s.max()) else round(float(s.max()), 3),
-                "mean": None if pd.isna(s.mean()) else round(float(s.mean()), 3),
-            })
-    # 全列统计
-    stats = []
-    for c in df.columns:
-        if c in ("utc", "Time_UTC"):
-            continue
-        s = df[c]
-        try:
-            stats.append({
-                "col": c,
-                "name": COLUMNS.get(c, {}).get("name", c),
-                "group": COLUMNS.get(c, {}).get("group", "derived"),
-                "unit": COLUMNS.get(c, {}).get("unit", ""),
-                "nan_frac": round(float(s.isna().mean()), 4),
-                "min": None if pd.isna(s.min()) else round(float(s.min()), 3),
-                "max": None if pd.isna(s.max()) else round(float(s.max()), 3),
-                "mean": None if pd.isna(s.mean()) else round(float(s.mean()), 3),
-            })
-        except Exception:
-            pass
-    return {"issues": issues, "stats": stats}
-
-
-@app.get("/api/segments")
-def api_segments():
-    """状态分段（供时序页背景带）"""
-    df = get_df()
-    ut = df["unix time"].to_numpy()
-    rotor = df["ROTOR_ON"].to_numpy().astype(int)
-    sysr = df["VESSEL.STAT0_SYS.RUNNING"].to_numpy().astype(int)
-    state = np.where(sysr == 1, rotor, 2)
-    change = np.where(np.diff(state) != 0)[0]
-    starts = np.concatenate([[0], change + 1])
-    ends = np.concatenate([change, [len(state) - 1]])
-    segs = []
-    for s, e in zip(starts, ends):
-        if int(ut[e] - ut[s]) < 60:
-            continue
-        segs.append({"t0": int(ut[s]), "t1": int(ut[e]), "state": int(state[s])})
-    return {"segments": segs}
-
-
 # ---------- 通用数据查看器 ----------
 
 CACHE_DIR = os.path.join(DATA_DIR, "cache")
+COLMETA_FILE = os.path.join(DATA_DIR, "colmeta.json")   # 列含义缓存（用户可编辑）
+
+
+def _load_colmeta() -> dict:
+    """列含义缓存: {列名: {unit, desc}}。文件不存在返回空（首次使用为空，可手动编辑补充）"""
+    if os.path.exists(COLMETA_FILE):
+        try:
+            with open(COLMETA_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+@app.get("/api/colmeta")
+def api_colmeta_get():
+    """读取列含义缓存"""
+    return _load_colmeta()
+
+
+@app.post("/api/colmeta")
+async def api_colmeta_save(request: Request):
+    """保存列含义缓存（整体覆盖）"""
+    try:
+        body = await request.body()
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            raise ValueError("需为 {列名: {unit, desc}} 结构")
+        with open(COLMETA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        return {"ok": True, "count": len(data)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"无效数据: {e}")
 
 
 def _read_table_bytes(buf: bytes, filename: str) -> "pd.DataFrame":
@@ -510,6 +138,7 @@ def _parse_excel_bytes(buf: bytes, filename: str) -> dict:
     """解析上传的表格（Excel/CSV）：自动识别表头行、时间列，返回前端 JSON"""
     t_start = time.time()
     size_mb = len(buf) / 1024 / 1024
+    colmeta = _load_colmeta()
     _log(f"[上传] {filename} ({size_mb:.1f} MB)")
 
     # --- 1. 读取 ---
@@ -594,11 +223,10 @@ def _parse_excel_bytes(buf: bytes, filename: str) -> dict:
         v = pd.to_numeric(data[c], errors="coerce")
         if v.notna().sum() == 0:
             continue  # 全非数值，跳过
-        meta = COLUMNS.get(c, {})
         cols[c] = {
             "v": [None if pd.isna(x) else (int(x) if float(x).is_integer() and abs(x) < 1e15 else round(float(x), 6)) for x in v.tolist()],
-            "unit": meta.get("unit", ""),
-            "desc": meta.get("name", ""),
+            "unit": colmeta.get(c, {}).get("unit", ""),
+            "desc": colmeta.get(c, {}).get("desc", ""),
         }
     if not cols:
         raise HTTPException(400, "未找到数值数据列")
@@ -800,19 +428,6 @@ async def api_uistate_save(hash: str, request: Request, beacon: int = 0):
     with open(_uistate_path(hash), "w", encoding="utf-8") as f:
         json.dump(st.model_dump(), f, ensure_ascii=False)
     return {"ok": True}
-
-
-@app.get("/advanced")
-def advanced(page: str = ""):
-    """高级分析页（旧版 7 页面）"""
-    fp = os.path.join(BASE_DIR, "static", "advanced.html")
-    with open(fp, encoding="utf-8") as f:
-        html = f.read()
-    if page:
-        inject = "<script>window.__PRESET_PAGE__=" + json.dumps(page) + ";</script>"
-        marker = '<script src="/static/js/advanced.js"></script>'
-        html = html.replace(marker, inject + marker)
-    return HTMLResponse(html)
 
 
 # ---------- 静态 ----------

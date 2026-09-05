@@ -8,6 +8,7 @@ data/uistate/
 data/session.json
 data/*.parquet
 data/meta.json
+data/colmeta.json
 
 # 截图/日志
 shots/
