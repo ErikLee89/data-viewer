@@ -411,6 +411,43 @@ function renderChart() {
       }
     }
   }
+  // ---------- 渲染层 min-max 采样 ----------
+  // 全量数据画 17 万点/列时 tooltip 重绘开销大；按像素分桶，每桶只保留最大/最小值
+  // （曲线外形不变、极值不丢，点数降到像素级）；所有系列共用同一桶边界，tooltip 仍全系列显示
+  const chartW = chart.getWidth ? chart.getWidth() : 1200;
+  const bucketPx = 2;                       // 每 2px 一桶
+  const nBuckets = Math.max(1, Math.floor(chartW / bucketPx));
+  const t0 = t[0], t1 = t[t.length - 1];
+  const span = t1 - t0 || 1;
+  // 预计算每个点落在哪个桶
+  const bucketOf = new Int32Array(t.length);
+  for (let j = 0; j < t.length; j++) bucketOf[j] = Math.min(nBuckets - 1, Math.floor((t[j] - t0) / span * nBuckets));
+  const needsSample = t.length > nBuckets * 4;   // 点数远超桶数才采样
+  function sampleMinMax(vals) {
+    if (!needsSample) return vals.map((v, j) => [t[j], v]);
+    const out = [];
+    let curB = -1, mn = null, mx = null, mnJ = -1, mxJ = -1;
+    const flush = () => {
+      if (curB < 0) return;
+      // 先小后大，保持时间顺序
+      if (mnJ === mxJ) out.push([t[mnJ], mn]);
+      else {
+        if (mnJ < mxJ) { out.push([t[mnJ], mn], [t[mxJ], mx]); }
+        else { out.push([t[mxJ], mx], [t[mnJ], mn]); }
+      }
+    };
+    for (let j = 0; j < vals.length; j++) {
+      const v = vals[j];
+      const b = bucketOf[j];
+      if (b !== curB) { flush(); curB = b; mn = mx = v; mnJ = mxJ = (v == null ? -1 : j); continue; }
+      if (v == null) continue;
+      if (mn == null || v < mn) { mn = v; mnJ = j; }
+      if (mx == null || v > mx) { mx = v; mxJ = j; }
+    }
+    flush();
+    return out;
+  }
+
   const series = [...selected].map((n, i) => {
     const c = DATA.cols[n];
     const angle = isAngleCol(n);
@@ -419,7 +456,7 @@ function renderChart() {
     return {
       name: displayName(n) + (angle ? " (展开)" : ""), type: "line", showSymbol: false,
       yAxisIndex: angle ? 1 : 0,
-      data: vals.map((v, j) => [t[j], v]),
+      data: sampleMinMax(vals),
       lineStyle: { width: 1.4 }, itemStyle: { color: PALETTE[i % PALETTE.length] },
     };
   });
@@ -451,24 +488,33 @@ function renderChart() {
       // 性能：大数据量下限制 tooltip 内容渲染频率
       throttle: 50,
       formatter: ps => {
-        // 按系列名去重（axisPointer 落在两点之间时同系列可能重复出现）
-        const seen = new Set();
-        const items = ps.filter(p => {
-          if (seen.has(p.seriesName)) return false;
-          seen.add(p.seriesName);
-          return true;
-        });
-        // 排序结果缓存：系列名集合不变时复用上次排序（避免每次 mousemove 都 localeCompare）
-        const key = items.map(p => p.seriesName).join("\u0001");
-        if (formatterCache._key !== key) {
-          items.sort((a, b) => a.seriesName.localeCompare(b.seriesName, undefined, { numeric: true, sensitivity: "base" }));
-          formatterCache._key = key;
-        } else {
-          items.sort((a, b) => formatterCache._order.indexOf(a.seriesName) - formatterCache._order.indexOf(b.seriesName));
+        // 采样后各系列 x 点集不同，axis 自动匹配会缺系列；
+        // 改为自己按 tooltip 时间查 DATA 全量数据（最近邻二分）
+        if (!ps || !ps.length) return "";
+        const tHover = ps[0].value[0];
+        // 二分找最近时间索引
+        const T = DATA.t;
+        let lo = 0, hi = T.length - 1;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (T[mid] < tHover) lo = mid + 1; else hi = mid;
         }
-        formatterCache._order = items.map(p => p.seriesName);
-        let s = `<b>${fmtTFull(items[0].value[0])}</b><br>`;
-        items.forEach(p => s += `${p.marker} ${esc(p.seriesName)}: <b>${p.value[1] ?? "-"}</b><br>`);
+        let idx = lo;
+        if (idx > 0 && Math.abs(T[idx-1] - tHover) < Math.abs(T[idx] - tHover)) idx = idx - 1;
+        // 用采样系列的 marker（颜色），但数值取全量 DATA
+        const markerOf = {};
+        ps.forEach(p => markerOf[p.seriesName] = p.marker);
+        const rows = [];
+        [...selected].forEach(n => {
+          const angle = isAngleCol(n);
+          let v = DATA.cols[n].v[idx];
+          if (angle && angleShift[n] && v != null) v = v + angleShift[n];
+          const name = displayName(n) + (angle ? " (展开)" : "");
+          rows.push({ name, v, marker: markerOf[name] || "" });
+        });
+        rows.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+        let s = `<b>${fmtTFull(T[idx])}</b><br>`;
+        rows.forEach(r => s += `${r.marker} ${esc(r.name)}: <b>${r.v ?? "-"}</b><br>`);
         return s;
       },
     },
