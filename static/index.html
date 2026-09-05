@@ -51,6 +51,10 @@ body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background: va
 .col-item .rename-btn { font-size:11px; color:var(--text2); cursor:pointer; flex-shrink:0; padding:2px 4px; border-radius:3px; visibility:hidden; }
 .col-item:hover .rename-btn { visibility:visible; }
 .col-item .rename-btn:hover { color:var(--primary); background:#eef4ff; }
+.col-item .angle-btn { font-size:13px; color:#c0c4cc; cursor:pointer; flex-shrink:0; padding:1px 5px; border-radius:3px; visibility:hidden; font-family:serif; }
+.col-item:hover .angle-btn { visibility:visible; }
+.col-item .angle-btn.on { color:#722ed1; visibility:visible; font-weight:bold; }
+.col-item .angle-btn:hover { color:#722ed1; background:#f4efff; }
 .col-item.locked { color:var(--text2); cursor:default; }
 .col-item.locked:hover { background:none; }
 
@@ -221,7 +225,18 @@ async function loadFile(file) {
 async function loadUIState() {
   colNames = {};
   selected = new Set();
+  angleOverride = {};
   window.__restoreZoom = null;
+  // 读取列含义缓存中的角度标记（用户手动指定，优先于自动规则）
+  try {
+    const r = await fetch("/api/colmeta", { cache: "no-store" });
+    if (r.ok) {
+      const meta = await r.json();
+      for (const [col, m] of Object.entries(meta)) {
+        if (m && m.angle !== undefined) angleOverride[col] = !!m.angle;
+      }
+    }
+  } catch (e) {}
   if (!FILE_HASH) return;
   try {
     const r = await fetch(`/api/uistate/${FILE_HASH}`);
@@ -301,8 +316,9 @@ function renderSidebar() {
     const angle = isAngleCol(n);
     return `<label class="col-item">
       <input type="checkbox" ${on ? "checked" : ""} onchange="toggleCol('${esc(n)}', this.checked)">
-      <span class="name" title="${esc(n)}${c.desc ? " · " + esc(c.desc) : ""}${angle ? " · 角度列已自动展开(消除0/360跳变)" : ""}" ondblclick="renameCol('${esc(n)}', this)">${esc(displayName(n))}</span>
-      ${angle ? `<span class="unit" style="color:#722ed1" title="角度列已自动展开：相邻差>180°时±360°修正，消除0/360假跳变">展开</span>` : (c.unit ? `<span class="unit">${esc(c.unit)}</span>` : "")}
+      <span class="name" title="${esc(n)}${c.desc ? " · " + esc(c.desc) : ""}${angle ? " · 角度列已展开(消除0/360跳变)" : ""}" ondblclick="renameCol('${esc(n)}', this)">${esc(displayName(n))}</span>
+      ${angle ? `<span class="unit" style="color:#722ed1" title="角度列已展开：相邻差>180°时±360°修正，消除0/360假跳变">展开</span>` : (c.unit ? `<span class="unit">${esc(c.unit)}</span>` : "")}
+      <span class="angle-btn${angle ? " on" : ""}" title="标记/取消角度列（角度列自动展开并挂副轴）" onclick="event.preventDefault();event.stopPropagation();toggleAngleMark('${esc(n)}')">${angle ? "∠" : "∠"}</span>
       <span class="rename-btn" onclick="renameCol('${esc(n)}', this.parentElement.querySelector('.name'))">改名</span>
     </label>`;
   }).join("");
@@ -350,14 +366,45 @@ function resetZoom() {
 // ---------- 主图（K线式缩放：底部滑块可拖动/边缘缩放，主图滚轮缩放） ----------
 // ---------- 角度列展开（unwrapping） ----------
 // 0°与360°在方向上相邻，直接画线会出现大幅假跳变；展开为连续序列消除跳变
-const ANGLE_PAT = /(AWA|TWA|TWD|WDIR|DIR|HEADING|HDG|COG|COURSE|BEARING|BEARING)/i;
+const ANGLE_PAT = /(AWA|TWA|TWD|WDIR|DIR|HEADING|HDG|COG|COURSE|BEARING|风向|风向角|方位|航向|罗经)/i;
+
+// 角度标记：用户手动指定（存 colmeta.json 的 angle 字段），优先于自动规则
+let angleOverride = {};   // {列名: true/false}
 
 function isAngleCol(name) {
+  if (angleOverride[name] !== undefined) return angleOverride[name];
   const c = DATA.cols[name];
   if (!c) return false;
   if (ANGLE_PAT.test(name)) return true;
   const u = (c.unit || "").toLowerCase();
   return u === "°" || u === "deg" || u === "degree" || u === "度";
+}
+
+async function toggleAngleMark(name) {
+  const c = DATA.cols[name];
+  if (!c) return;
+  const cur = isAngleCol(name);
+  angleOverride[name] = !cur;
+  // 持久化到 colmeta（服务端）
+  try {
+    const r = await fetch("/api/colmeta", { cache: "no-store" });
+    const meta = r.ok ? await r.json() : {};
+    if (!meta[name]) meta[name] = { unit: "", desc: "" };
+    meta[name].angle = !cur;
+    await fetch("/api/colmeta", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(meta),
+    });
+    toast(!cur ? `${displayName(name)} 已标记为角度列（展开+副轴）` : `${displayName(name)} 已取消角度标记`);
+  } catch (e) {
+    toast("标记已生效但保存失败: " + e.message);
+  }
+  // 清展开缓存重算
+  if (c._unwrapped) { c._unwrapped = null; }
+  renderSidebar();
+  renderChart();
+  saveUIState();
 }
 
 // 展开算法：相邻差 >180° 时 ±360° 修正，返回新数组（缓存避免重复计算）
