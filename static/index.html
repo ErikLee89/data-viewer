@@ -6,6 +6,7 @@
 <title>数据查看器</title>
 <script src="/static/echarts.min.js"></script>
 <script src="/static/js/dayjs.min.js"></script>
+<script src="/static/js/time-series-sampling.js"></script>
 <script src="/static/js/dayjs-utc.min.js"></script>
 <script>dayjs.extend(dayjs_plugin_utc);</script>
 <style>
@@ -58,6 +59,31 @@ body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background: va
 .col-item.locked { color:var(--text2); cursor:default; }
 .col-item.locked:hover { background:none; }
 
+/* 左侧历史文件抽屉 */
+.history-drawer { position:fixed; left:0; top:50%; width:min(320px, calc(100vw - 40px)); height:min(560px, calc(100dvh - 100px)); z-index:50; transform:translate(-100%, -50%); transition:transform .18s ease; pointer-events:none; }
+.history-drawer.open { transform:translate(0, -50%); }
+.history-trigger { position:absolute; left:100%; top:50%; transform:translateY(-50%); width:26px; height:64px; display:flex; align-items:center; justify-content:center; background:var(--card); color:var(--primary); border:1px solid var(--border); border-left:0; border-radius:0 8px 8px 0; box-shadow:3px 2px 10px #1f293714; cursor:pointer; pointer-events:auto; }
+.history-trigger svg { width:18px; height:18px; transition:transform .18s ease; }
+.history-drawer.open .history-trigger svg { transform:rotate(180deg); }
+.history-trigger:hover { background:#f0f7ff; }
+.history-trigger:focus-visible, .history-item:focus-visible, .history-retry:focus-visible { outline:2px solid var(--primary); outline-offset:-2px; }
+.history-panel { height:100%; display:flex; flex-direction:column; background:var(--card); border:1px solid var(--border); border-left:0; border-radius:0 12px 12px 0; box-shadow:6px 4px 24px #1f29371a; visibility:hidden; transition:visibility .18s; }
+.history-drawer.open .history-panel { visibility:visible; pointer-events:auto; }
+.history-head { display:flex; align-items:center; justify-content:space-between; padding:16px; border-bottom:1px solid var(--border); }
+.history-head h2 { font-size:14px; font-weight:600; }
+.history-count { font-size:12px; color:var(--text2); }
+.history-list { flex:1; min-height:0; overflow-y:auto; padding:8px; overscroll-behavior:contain; }
+.history-item { display:block; width:100%; padding:11px 12px; margin-bottom:4px; text-align:left; font:inherit; color:var(--text); border:1px solid transparent; border-radius:7px; background:transparent; cursor:pointer; }
+.history-item:hover { background:#f5f8ff; }
+.history-item.active { background:#eef5ff; border-color:#c7ddff; }
+.history-file { display:flex; align-items:center; gap:8px; }
+.history-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; font-weight:500; }
+.history-current { flex-shrink:0; color:var(--primary); font-size:11px; }
+.history-meta { display:block; margin-top:5px; color:var(--text2); font-size:11px; line-height:1.6; }
+.history-message { padding:28px 12px; text-align:center; color:var(--text2); font-size:13px; line-height:1.8; }
+.history-retry { display:block; margin:12px auto 0; padding:4px 12px; color:var(--primary); background:var(--card); border:1px solid var(--border); border-radius:5px; cursor:pointer; }
+@media (prefers-reduced-motion: reduce) { .history-drawer, .history-trigger svg, .history-panel { transition:none; } }
+
 /* 空状态 */
 .empty { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; color:var(--text2); }
 .empty .icon { font-size:48px; opacity:.4; }
@@ -88,7 +114,7 @@ body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background: va
 <div class="topbar">
   <button class="btn" id="btn-open" onclick="pickFile()">选择数据文件</button>
   <div class="file-title" id="file-title">未加载文件</div>
-  <button class="btn ghost" id="btn-export" onclick="exportPNG()" disabled>导出图片</button>
+  <button class="btn ghost" id="btn-export" onclick="exportPNG()" title="导出图片（Ctrl+Shift+E，包含当前悬浮弹窗）" aria-keyshortcuts="Control+Shift+E Meta+Shift+E" disabled>导出图片</button>
   <div class="file-info" id="file-info"></div>
 </div>
 
@@ -106,6 +132,16 @@ body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background: va
     <div id="cols"></div>
   </div>
 </div>
+
+<aside class="history-drawer" id="history-drawer" aria-label="历史数据文件">
+  <button class="history-trigger" id="history-trigger" type="button" aria-label="历史数据文件" aria-expanded="false" aria-controls="history-panel" title="历史数据文件">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m9 6 6 6-6 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </button>
+  <div class="history-panel" id="history-panel" inert>
+    <div class="history-head"><h2>历史数据文件</h2><span class="history-count" id="history-count"></span></div>
+    <div class="history-list" id="history-list" aria-live="polite"><div class="history-message">正在读取历史文件...</div></div>
+  </div>
+</aside>
 
 <div id="toast"></div>
 <div id="loading">
@@ -155,6 +191,118 @@ function showLoading(on, text, pct) {
 function fmtT(ms) { return dayjs(ms).utc().format("MM-DD HH:mm"); }
 function fmtTFull(ms) { return dayjs(ms).utc().format("YYYY-MM-DD HH:mm:ss"); }
 
+// ---------- 历史数据文件 ----------
+let historyItems = [];
+let historyRequest = null;
+let historyUpdatedAt = 0;
+const historyDrawer = document.getElementById("history-drawer");
+const historyTrigger = document.getElementById("history-trigger");
+
+function setHistoryOpen(open) {
+  historyDrawer.classList.toggle("open", open);
+  historyTrigger.setAttribute("aria-expanded", String(open));
+  document.getElementById("history-panel").inert = !open;
+  if (open) refreshHistory();
+}
+historyDrawer.addEventListener("pointerenter", () => setHistoryOpen(true));
+historyDrawer.addEventListener("pointerleave", () => setHistoryOpen(false));
+historyDrawer.addEventListener("focusin", () => setHistoryOpen(true));
+historyDrawer.addEventListener("focusout", e => {
+  if (!historyDrawer.contains(e.relatedTarget) && !historyDrawer.matches(":hover")) setHistoryOpen(false);
+});
+historyTrigger.addEventListener("click", () => setHistoryOpen(true));
+historyDrawer.addEventListener("keydown", e => {
+  if (e.key === "Escape") {
+    historyTrigger.focus();
+    setHistoryOpen(false);
+    e.preventDefault();
+  }
+});
+
+function renderHistory() {
+  const box = document.getElementById("history-list");
+  box.replaceChildren();
+  document.getElementById("history-count").textContent = `${historyItems.length} 个文件`;
+  if (!historyItems.length) {
+    box.innerHTML = '<div class="history-message">暂无历史数据文件<br>打开数据文件后会自动保留在这里</div>';
+    return;
+  }
+  for (const item of historyItems) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "history-item" + (item.hash === FILE_HASH ? " active" : "");
+    if (item.hash === FILE_HASH) button.setAttribute("aria-current", "true");
+    const filename = item.file || "未命名文件";
+    button.title = filename;
+    button.innerHTML = `<span class="history-file"><span class="history-name">${esc(filename)}</span>${item.hash === FILE_HASH ? '<span class="history-current">当前</span>' : ''}</span>
+      <span class="history-meta">${Number(item.rows || 0).toLocaleString()} 行 · ${Number(item.cols || 0).toLocaleString()} 列<br>${esc(item.mtime || '')}</span>`;
+    button.addEventListener("click", () => openHistoryFile(item));
+    box.appendChild(button);
+  }
+}
+
+async function refreshHistory(force = false) {
+  if (historyRequest) return historyRequest;
+  if (!force && Date.now() - historyUpdatedAt < 30000) return;
+  historyRequest = (async () => {
+    try {
+      const r = await fetch("/api/cache", { cache: "no-store" });
+      if (!r.ok) throw new Error("读取历史文件失败");
+      const result = await r.json();
+      historyItems = result.items || [];
+      historyUpdatedAt = Date.now();
+      renderHistory();
+    } catch (e) {
+      const box = document.getElementById("history-list");
+      box.innerHTML = '<div class="history-message">历史文件暂时无法读取<button class="history-retry" type="button">重试</button></div>';
+      box.querySelector("button").addEventListener("click", () => refreshHistory(true));
+    }
+  })();
+  try { await historyRequest; } finally { historyRequest = null; }
+}
+
+function beginFileLoad() {
+  const gen = ++loadGen;
+  clearTimeout(saveTimer);
+  doSaveUIState(); // 切换前保存当前文件，避免防抖任务写到新文件
+  setHistoryOpen(false);
+  return gen;
+}
+
+async function openCachedFile(hash) {
+  const r = await fetch("/api/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ hash }),
+  });
+  if (!r.ok) {
+    const error = await r.json().catch(() => ({}));
+    throw new Error(error.detail || `服务端错误 ${r.status}`);
+  }
+  return r.json();
+}
+
+async function openHistoryFile(item) {
+  if (item.hash === FILE_HASH && DATA) { setHistoryOpen(false); return; }
+  const gen = beginFileLoad();
+  try {
+    showLoading(true, `正在加载历史数据: ${item.file || '未命名文件'}`);
+    const data = await openCachedFile(item.hash);
+    if (gen !== loadGen) return;
+    DATA = data;
+    FILE_HASH = item.hash;
+    await loadUIState();
+    if (gen !== loadGen) return;
+    afterLoad();
+  } catch (e) {
+    if (gen !== loadGen) return;
+    toast("加载失败: " + e.message, 4000);
+    refreshHistory(true);
+  } finally {
+    if (gen === loadGen) showLoading(false);
+  }
+}
+
 // ---------- 文件选择 ----------
 function pickFile() {
   const inp = document.createElement("input");
@@ -165,7 +313,7 @@ function pickFile() {
 }
 
 async function loadFile(file) {
-  const gen = ++loadGen;   // 本次加载的代际
+  const gen = beginFileLoad();   // 本次加载的代际
   const totalMB = (file.size / 1024 / 1024).toFixed(1);
   try {
     // --- 0. 算文件 SHA-256，查缓存 ---
@@ -173,18 +321,15 @@ async function loadFile(file) {
     const buf = await file.arrayBuffer();
     const digest = await crypto.subtle.digest("SHA-256", buf);
     const hash = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
-    FILE_HASH = hash;
+    if (gen !== loadGen) return;
     let data = null;
     try {
-      const r = await fetch("/api/cache/" + hash);
-      if (r.ok) {
-        showLoading(true, "缓存命中，加载中...");
-        data = await r.json();
-        if (gen !== loadGen) return;   // 已有新加载，放弃本次
-        toast("已从缓存加载（免上传免解析）");
-      }
+      data = await openCachedFile(hash);
+      if (gen !== loadGen) return;
+      toast("已从缓存加载（免上传免解析）");
     } catch (e) { /* 缓存查询失败则正常上传 */ }
 
+    if (gen !== loadGen) return;
     if (!data) {
       // --- 1. 上传（XHR 带进度）---
       showLoading(true, `正在上传 ${file.name} (${totalMB} MB)...`, 0);
@@ -210,14 +355,18 @@ async function loadFile(file) {
         xhr.send(fd);
       });
     }
+    if (gen !== loadGen) return;
     showLoading(true, "正在绘制曲线...");
     DATA = data;
+    FILE_HASH = hash;
     await loadUIState();   // 恢复列名/选中列/缩放状态
+    if (gen !== loadGen) return;
     afterLoad();
+    refreshHistory(true);
   } catch (e) {
-    toast("加载失败: " + e.message, 4000);
+    if (gen === loadGen) toast("加载失败: " + e.message, 4000);
   } finally {
-    showLoading(false);
+    if (gen === loadGen) showLoading(false);
   }
 }
 
@@ -226,7 +375,7 @@ async function loadUIState() {
   colNames = {};
   selected = new Set();
   angleOverride = {};
-  window.__restoreZoom = null;
+  window.__restoreZoom = [0, 100];
   // 读取列含义缓存中的角度标记（用户手动指定，优先于自动规则）
   try {
     const r = await fetch("/api/colmeta", { cache: "no-store" });
@@ -292,6 +441,7 @@ window.addEventListener("beforeunload", () => {
 });
 
 function afterLoad() {
+  renderHistory();
   const names = Object.keys(DATA.cols);
   // 默认不选任何列；有保存状态则已恢复
   if (!selected.size) selected = new Set();
@@ -434,6 +584,52 @@ function unwrapSeries(name) {
 
 // 归一化到 [0,360) 仅用于判断显示（不影响展开值）
 
+// ---------- 随可见范围重新取样 ----------
+let chartView = null;
+let viewUpdateTimer = null;
+function currentChartZoom() {
+  const option = chart && chart.getOption();
+  const dz = option && option.dataZoom;
+  return dz && dz[1] ? [dz[1].start, dz[1].end] : [0, 100];
+}
+function buildViewSeries(zoom) {
+  const { data, series, cache } = chartView;
+  const times = data.t;
+  const lo = times[0], hi = times[times.length - 1];
+  const start = lo + (hi - lo) * zoom[0] / 100;
+  const end = lo + (hi - lo) * zoom[1] / 100;
+  const width = Math.max(1, chart.getWidth() - 136);
+  const key = `${start}:${end}:${width}`;
+  let sampled = cache.get(key);
+  if (!sampled) {
+    sampled = series.map(s => TimeSeriesSampling.sample(times, s.values, start, end, width));
+    cache.set(key, sampled);
+    if (cache.size > 8) cache.delete(cache.keys().next().value);
+  }
+  const result = series.map((s, i) => ({
+    id: s.id, name: s.name, type: "line", showSymbol: false, connectNulls: false,
+    yAxisIndex: s.yAxisIndex, data: sampled[i],
+    lineStyle: { width: 1.4 }, itemStyle: { color: s.color },
+  }));
+  // Independent full-range overview keeps the slider stable while the main series changes.
+  const overviewKey = `overview:${width}`;
+  if (!cache.has(overviewKey)) {
+    cache.set(overviewKey, series.length ? TimeSeriesSampling.sample(times, series[0].values, lo, hi, width) : [[lo, null], [hi, null]]);
+  }
+  result.push({ id: "overview", name: "", type: "line", xAxisIndex: 1, yAxisIndex: 2,
+    data: cache.get(overviewKey), showSymbol: false, silent: true,
+    lineStyle: { opacity: 0 }, itemStyle: { opacity: 0 }, tooltip: { show: false } });
+  return result;
+}
+function scheduleViewUpdate() {
+  if (viewUpdateTimer != null) return;
+  viewUpdateTimer = setTimeout(() => {
+    viewUpdateTimer = null;
+    if (!chartView || chartView.data !== DATA) return;
+    chart.setOption({ series: buildViewSeries(currentChartZoom()) }, { replaceMerge: ["series"], silent: true });
+  }, 60);
+}
+
 function renderChart() {
   if (!chart) chart = echarts.init(document.getElementById("chart"));
   const t = DATA.t;
@@ -458,55 +654,16 @@ function renderChart() {
       }
     }
   }
-  // ---------- 渲染层 min-max 采样 ----------
-  // 全量数据画 17 万点/列时 tooltip 重绘开销大；按像素分桶，每桶只保留最大/最小值
-  // （曲线外形不变、极值不丢，点数降到像素级）；所有系列共用同一桶边界，tooltip 仍全系列显示
-  const chartW = chart.getWidth ? chart.getWidth() : 1200;
-  const bucketPx = 2;                       // 每 2px 一桶
-  const nBuckets = Math.max(1, Math.floor(chartW / bucketPx));
-  const t0 = t[0], t1 = t[t.length - 1];
-  const span = t1 - t0 || 1;
-  // 预计算每个点落在哪个桶
-  const bucketOf = new Int32Array(t.length);
-  for (let j = 0; j < t.length; j++) bucketOf[j] = Math.min(nBuckets - 1, Math.floor((t[j] - t0) / span * nBuckets));
-  const needsSample = t.length > nBuckets * 4;   // 点数远超桶数才采样
-  function sampleMinMax(vals) {
-    if (!needsSample) return vals.map((v, j) => [t[j], v]);
-    const out = [];
-    let curB = -1, mn = null, mx = null, mnJ = -1, mxJ = -1;
-    const flush = () => {
-      if (curB < 0) return;
-      // 先小后大，保持时间顺序
-      if (mnJ === mxJ) out.push([t[mnJ], mn]);
-      else {
-        if (mnJ < mxJ) { out.push([t[mnJ], mn], [t[mxJ], mx]); }
-        else { out.push([t[mxJ], mx], [t[mnJ], mn]); }
-      }
-    };
-    for (let j = 0; j < vals.length; j++) {
-      const v = vals[j];
-      const b = bucketOf[j];
-      if (b !== curB) { flush(); curB = b; mn = mx = v; mnJ = mxJ = (v == null ? -1 : j); continue; }
-      if (v == null) continue;
-      if (mn == null || v < mn) { mn = v; mnJ = j; }
-      if (mx == null || v > mx) { mx = v; mxJ = j; }
-    }
-    flush();
-    return out;
-  }
-
-  const series = [...selected].map((n, i) => {
-    const c = DATA.cols[n];
+  const visibleSeries = [...selected].map((n, i) => {
     const angle = isAngleCol(n);
-    let vals = angle ? unwrapSeries(n) : c.v;
-    if (angle && angleShift[n]) vals = vals.map(v => v == null ? null : v + angleShift[n]);
-    return {
-      name: displayName(n) + (angle ? " (展开)" : ""), type: "line", showSymbol: false,
-      yAxisIndex: angle ? 1 : 0,
-      data: sampleMinMax(vals),
-      lineStyle: { width: 1.4 }, itemStyle: { color: PALETTE[i % PALETTE.length] },
-    };
+    let values = angle ? unwrapSeries(n) : DATA.cols[n].v;
+    if (angle && angleShift[n]) values = values.map(v => v == null ? null : v + angleShift[n]);
+    return { id: "column:" + n, name: displayName(n) + (angle ? " (展开)" : ""),
+      values, yAxisIndex: angle ? 1 : 0, color: PALETTE[i % PALETTE.length] };
   });
+  chartView = { data: DATA, series: visibleSeries, cache: new Map() };
+  const zoom = window.__restoreZoom || currentChartZoom();
+  const series = buildViewSeries(zoom);
   // 保留当前缩放状态（勾选列时不重置）
   let keepZoom = null;
   if (chart.getOption) {
@@ -520,6 +677,8 @@ function renderChart() {
     animation: false,
     tooltip: {
       trigger: "axis",
+      className: "chart-tooltip",
+      confine: true,
       // 性能：关词 tooltip 位置过渡动画（默认 0.4s，是跟随延迟的主因）
       transitionDuration: 0,
       // 性能：鼠标移动节流间隔（ms），降低高频重绘
@@ -554,7 +713,7 @@ function renderChart() {
         selArr.forEach((n, i) => {
           const angle = isAngleCol(n);
           let v = DATA.cols[n].v[idx];
-          if (angle && angleShift[n] && v != null) v = v + angleShift[n];
+          // Tooltip reports the original measurement, including raw angle values.
           const name = displayName(n) + (angle ? " (展开)" : "");
           const color = PALETTE[i % PALETTE.length];
           const marker = '<span style="display:inline-block;margin-right:4px;border-radius:10px;width:10px;height:10px;background-color:' + color + ';"></span>';
@@ -566,27 +725,28 @@ function renderChart() {
         return s;
       },
     },
-    legend: { top: 4, type: "scroll", textStyle: { fontSize: 11 } },
+    legend: { top: 4, type: "scroll", data: visibleSeries.map(s => s.name), textStyle: { fontSize: 11 } },
     grid: { left: 64, right: hasAngle ? 72 : 24, top: 40, bottom: 78 },
-    xAxis: {
-      type: "time",
-      axisLabel: { formatter: v => fmtT(v) },
-    },
+    xAxis: [
+      { type: "time", min: t[0], max: t[t.length - 1], axisLabel: { formatter: v => fmtT(v) } },
+      { type: "time", min: t[0], max: t[t.length - 1], show: false, axisPointer: { show: false } },
+    ],
     yAxis: [
       { type: "value", scale: true },
       // 副轴：角度列专用（展开后的连续值）
-      ...(hasAngle ? [{
-        type: "value", scale: true, name: "角度°(展开)",
+      {
+        type: "value", show: hasAngle, scale: true, name: "角度°(展开)",
         nameTextStyle: { color: "#722ed1", fontSize: 11 },
         axisLine: { show: true, lineStyle: { color: "#722ed1" } },
         splitLine: { show: false },
         axisLabel: { color: "#722ed1", formatter: v => Math.round(v) + "°" },
-      }] : []),
+      },
+      { type: "value", show: false, scale: true },
     ],
     dataZoom: [
-      { type: "inside", xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseMove: true },
+      { type: "inside", xAxisIndex: [0, 1], filterMode: "none", throttle: 50, zoomOnMouseWheel: true, moveOnMouseMove: true },
       {
-        type: "slider", xAxisIndex: 0, bottom: 14, height: 46,
+        type: "slider", xAxisIndex: [1, 0], filterMode: "none", throttle: 50, showDataShadow: true, bottom: 14, height: 46,
         borderColor: "#d9d9d9", fillerColor: "rgba(22,119,255,0.14)",
         handleStyle: { color: "#1677ff" }, moveHandleStyle: { color: "#1677ff" },
         dataBackground: { lineStyle: { color: "#b8c8e8", width: 1 }, areaStyle: { color: "rgba(22,119,255,0.08)" } },
@@ -607,11 +767,13 @@ function renderChart() {
     opt.dataZoom[0].start = keepZoom[0]; opt.dataZoom[0].end = keepZoom[1];
     opt.dataZoom[1].start = keepZoom[0]; opt.dataZoom[1].end = keepZoom[1];
   }
+  clearTimeout(viewUpdateTimer);
+  viewUpdateTimer = null;
   chart.setOption(opt, true);
   // 缩放变化 → 保存状态
   if (!chart._zoomBound) {
     chart._zoomBound = true;
-    chart.on("datazoom", () => saveUIState());
+    chart.on("datazoom", () => { scheduleViewUpdate(); saveUIState(); });
     bindSliderTooltip();
   }
 }
@@ -620,6 +782,7 @@ function renderChart() {
 function bindSliderTooltip() {
   // 自建 tooltip div（滑块区域鼠标跟随）
   const tip = document.createElement("div");
+  tip.id = "slider-time-tooltip";
   tip.style.cssText = "position:fixed;z-index:99;display:none;pointer-events:none;background:#1f2937;color:#fff;padding:4px 10px;border-radius:4px;font-size:12px;font-family:Consolas,monospace;white-space:nowrap;";
   document.body.appendChild(tip);
 
@@ -636,8 +799,9 @@ function bindSliderTooltip() {
     // 滑块范围：gridBottomPx ~ chartH（含 slider），x 在 grid 内
     const inSlider = yIn > gridBottomPx && yIn < c.getHeight() && xIn >= gRect.x && xIn <= gRect.x + gRect.width;
     if (inSlider) {
-      // 像素 → 时间值（用主 xAxis，含当前缩放）
-      const t = c.convertFromPixel({ xAxisIndex: 0 }, xIn);
+      // 滑块展示全程概览，悬浮时间始终按完整时间范围计算。
+      const ratio = (xIn - gRect.x) / gRect.width;
+      const t = DATA.t[0] + ratio * (DATA.t[DATA.t.length - 1] - DATA.t[0]);
       if (t && isFinite(t)) {
         tip.textContent = fmtTFull(t);
         tip.style.display = "block";
@@ -703,22 +867,99 @@ async function tryRestoreSession() {
 }
 
 // ---------- 启动 ----------
+refreshHistory();
 pollLogs();
 setInterval(pollLogs, 1000);
 tryRestoreSession();
 
 // ---------- 导出 ----------
-function exportPNG() {
-  if (!chart) return;
-  const url = chart.getDataURL({ type: "png", pixelRatio: 2, backgroundColor: "#fff" });
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = (DATA ? DATA.file.replace(/\.(xlsx|xls)$/i, "") : "chart") + "_" + fmtT(Date.now()).replace(/[ :]/g, "") + ".png";
-  a.click();
-  toast("已导出 PNG");
+// HTML tooltip lives outside the chart canvas; paint its visible contents onto the export copy.
+function paintVisibleTooltip(context) {
+  const tip = document.querySelector("#chart .chart-tooltip");
+  if (!tip) return;
+  const style = getComputedStyle(tip);
+  if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return;
+  const box = tip.getBoundingClientRect();
+  if (!box.width || !box.height) return;
+  const chartBox = document.getElementById("chart").getBoundingClientRect();
+  const x = box.left - chartBox.left, y = box.top - chartBox.top;
+  context.save();
+  context.fillStyle = style.backgroundColor;
+  context.shadowColor = "rgba(0, 0, 0, .2)";
+  context.shadowBlur = 10;
+  context.shadowOffsetX = 1;
+  context.shadowOffsetY = 2;
+  context.beginPath();
+  context.roundRect(x, y, box.width, box.height, parseFloat(style.borderRadius) || 0);
+  context.fill();
+  context.shadowColor = "transparent";
+  const borderWidth = parseFloat(style.borderWidth) || 0;
+  if (borderWidth) {
+    context.lineWidth = borderWidth;
+    context.strokeStyle = style.borderColor;
+    context.stroke();
+  }
+  // Match the existing HTML marker colors and layout.
+  for (const marker of tip.querySelectorAll("span")) {
+    if (marker.textContent || !marker.style.backgroundColor) continue;
+    const rect = marker.getBoundingClientRect();
+    context.fillStyle = getComputedStyle(marker).backgroundColor;
+    context.beginPath();
+    context.ellipse(rect.left - chartBox.left + rect.width / 2,
+      rect.top - chartBox.top + rect.height / 2, rect.width / 2, rect.height / 2, 0, 0, Math.PI * 2);
+    context.fill();
+  }
+  const walker = document.createTreeWalker(tip, NodeFilter.SHOW_TEXT);
+  const range = document.createRange();
+  context.textBaseline = "top";
+  let node;
+  while ((node = walker.nextNode())) {
+    if (!node.textContent.trim()) continue;
+    range.selectNodeContents(node);
+    const rect = range.getBoundingClientRect();
+    const textStyle = getComputedStyle(node.parentElement);
+    context.font = `${textStyle.fontStyle} ${textStyle.fontWeight} ${textStyle.fontSize} ${textStyle.fontFamily}`;
+    context.fillStyle = textStyle.color;
+    context.fillText(node.textContent, rect.left - chartBox.left, rect.top - chartBox.top);
+  }
+  context.restore();
 }
 
-window.addEventListener("resize", () => { chart && chart.resize(); });
+function exportPNG() {
+  if (!chart || !DATA || document.getElementById("btn-export").disabled ||
+      document.getElementById("loading").style.display === "flex") return;
+  try {
+    const pixelRatio = 2;
+    const rendered = chart.renderToCanvas({ pixelRatio, backgroundColor: "#fff" });
+    const canvas = document.createElement("canvas");
+    canvas.width = rendered.width;
+    canvas.height = rendered.height;
+    const context = canvas.getContext("2d");
+    context.drawImage(rendered, 0, 0);
+    context.scale(pixelRatio, pixelRatio);
+    paintVisibleTooltip(context);
+    const a = document.createElement("a");
+    a.href = canvas.toDataURL("image/png");
+    a.download = DATA.file.replace(/\.(xlsx|xls|csv)$/i, "") + "_" + fmtT(Date.now()).replace(/[ :]/g, "") + ".png";
+    a.click();
+    toast("已导出 PNG");
+  } catch (e) {
+    toast("导出失败: " + e.message, 4000);
+  }
+}
+
+window.addEventListener("keydown", e => {
+  if (e.repeat || e.isComposing || !(e.ctrlKey || e.metaKey) || !e.shiftKey || e.altKey || e.key.toLowerCase() !== "e") return;
+  const target = e.target;
+  if (target instanceof Element && (target.isContentEditable || target.closest("input, textarea, select"))) return;
+  if (!chart || !DATA || document.getElementById("loading").style.display === "flex") return;
+  e.preventDefault();
+  exportPNG();
+});
+
+window.addEventListener("resize", () => {
+  if (chart) { chart.resize(); scheduleViewUpdate(); }
+});
 </script>
 </body>
 </html>

@@ -13,3 +13,10 @@ data/colmeta.json
 # 截图/日志
 shots/
 *.log
+
+# 本地测试缓存及报告
+.pytest_cache/
+/tests/cache/
+/cache/
+/test-results/
+/playwright-report/

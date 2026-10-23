@@ -19,7 +19,10 @@ from pydantic import BaseModel
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
-app = FastAPI(title="数据查看器")
+with open(os.path.join(BASE_DIR, "VERSION"), encoding="utf-8") as version_file:
+    APP_VERSION = version_file.read().strip()
+
+app = FastAPI(title="数据查看器", version=APP_VERSION)
 
 # GZip 压缩响应（大数据 JSON 传输提速）
 from fastapi.middleware.gzip import GZipMiddleware
@@ -345,6 +348,18 @@ def api_cache_get(hash: str):
     _log(f"[缓存] 命中 {hash[:16]}...，直接返回")
     with open(fp, encoding="utf-8") as f:
         return json.load(f)
+
+
+class SessionSelection(BaseModel):
+    hash: str
+
+
+@app.post("/api/session")
+def api_session_select(selection: SessionSelection):
+    """打开历史缓存，同时记录为下次恢复的会话。"""
+    data = api_cache_get(selection.hash)
+    _save_session(selection.hash, data)
+    return data
 
 
 @app.get("/api/cache")
